@@ -8,9 +8,10 @@ use id3::TagLike;
 use id3::Version::Id3v24;
 use regex::Regex;
 use shell_words;
-use termusiclib::invidious::{Instance, YoutubeVideo, ytdlp_search};
+use termusiclib::invidious::{Instance, YoutubeVideo, annotate_lyrics_availability, ytdlp_search};
 use termusiclib::track::DurationFmtShort;
 use termusiclib::utils::get_parent_folder;
+use tokio::sync::mpsc::UnboundedSender;
 use tuirealm::props::{
     AttrValue, Attribute, HorizontalAlignment, LineStatic, Style, TableBuilder, Title,
 };
@@ -71,7 +72,12 @@ impl YoutubeOptions {
             let instance = self.invidious_instance.clone();
 
             return Some(async move {
-                res.items = instance.get_search_query(res.page).await?;
+                let items = instance.get_search_query(res.page).await?;
+                let annotated =
+                    tokio::task::spawn_blocking(move || annotate_lyrics_availability(items).0)
+                        .await
+                        .unwrap_or_default();
+                res.items = annotated;
                 Ok(res)
             });
         }
@@ -90,7 +96,12 @@ impl YoutubeOptions {
         let instance = self.invidious_instance.clone();
 
         async move {
-            res.items = instance.get_search_query(res.page).await?;
+            let items = instance.get_search_query(res.page).await?;
+            let annotated =
+                tokio::task::spawn_blocking(move || annotate_lyrics_availability(items).0)
+                    .await
+                    .unwrap_or_default();
+            res.items = annotated;
             Ok(res)
         }
     }
@@ -153,14 +164,7 @@ impl Model {
                                     domain.clone(),
                                 ))).ok();
                             }
-                            for item in &result {
-                                tx.send(Msg::YoutubeSearch(YSMsg::YoutubeItem(item.clone()))).ok();
-                            }
-                            let youtube_options = YoutubeOptions {
-                                data: YoutubeData { items: result, page: 1 },
-                                invidious_instance: instance,
-                            };
-                            tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchSuccess(youtube_options))).ok();
+                            Self::youtube_options_send_annotated(tx.clone(), instance, result);
                         }
                         Err(_) => {
                             tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchFail("No search source succeeded".into()))).ok();
@@ -173,14 +177,7 @@ impl Model {
                             tx.send(Msg::YoutubeSearch(YSMsg::SearchStatus(
                                 "yt-dlp (fastest)".to_string(),
                             ))).ok();
-                            for item in &result {
-                                tx.send(Msg::YoutubeSearch(YSMsg::YoutubeItem(item.clone()))).ok();
-                            }
-                            let youtube_options = YoutubeOptions {
-                                data: YoutubeData { items: result, page: 1 },
-                                invidious_instance: instance,
-                            };
-                            tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchSuccess(youtube_options))).ok();
+                            Self::youtube_options_send_annotated(tx.clone(), instance, result);
                         }
                         Err(e) => {
                             tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchFail(format!("yt-dlp failed: {e}")))).ok();
@@ -188,6 +185,38 @@ impl Model {
                     }
                 }
             }
+        });
+    }
+
+    /// Mark every search result with a lyrics-availability indicator (whether
+    /// caelestia will find lyrics for the file tags the downloader will write)
+    /// and stream them to the UI. Sent one-by-one for progressive display.
+    fn youtube_options_send_annotated(
+        tx: UnboundedSender<Msg>,
+        instance: Instance,
+        result: Vec<YoutubeVideo>,
+    ) {
+        let total = result.len();
+        tx.send(Msg::YoutubeSearch(YSMsg::SearchStatus(format!(
+            "Checking lyrics availability ({total} videos)"
+        ))))
+        .ok();
+        tokio::task::spawn_blocking(move || {
+            let (annotated, kept) = annotate_lyrics_availability(result);
+            let _ = tx.send(Msg::YoutubeSearch(YSMsg::SearchStatus(format!(
+                "{kept} of {total} results will have lyrics (LRCLIB / NetEase)"
+            ))));
+            for item in &annotated {
+                let _ = tx.send(Msg::YoutubeSearch(YSMsg::YoutubeItem(item.clone())));
+            }
+            let youtube_options = YoutubeOptions {
+                data: YoutubeData {
+                    items: annotated,
+                    page: 1,
+                },
+                invidious_instance: instance,
+            };
+            let _ = tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchSuccess(youtube_options)));
         });
     }
 
@@ -304,9 +333,6 @@ impl Model {
             Arg::new_with_arg("--metadata-from-title", "%(artist) - %(title)s"),
             #[cfg(target_os = "windows")]
             Arg::new("--restrict-filenames"),
-            Arg::new("--write-sub"),
-            Arg::new("--all-subs"),
-            Arg::new_with_arg("--convert-subs", "lrc"),
             Arg::new_with_arg("--output", "%(title).90s.%(ext)s"),
         ];
         let extra_args = parse_args(&config_tui.settings.ytdlp.extra_args)

@@ -262,3 +262,229 @@ impl Instance {
         Some((title, video_id, length_seconds))
     }
 }
+
+use std::sync::{Arc, LazyLock};
+use std::thread;
+
+use regex::Regex;
+
+const LRCLIB_USER_AGENT: &str = "termusic (https://github.com/tramhao/termusic)";
+const LRCLIB_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_FILTER_CONCURRENCY: usize = 6;
+
+/// Prefixed to a search result's title when caelestia will show lyrics for it
+/// (LRCLIB exact match or NetEase, using the tags the downloader will write).
+const HAS_LYRICS_MARK: char = '\u{f00c}'; // 
+/// Prefixed to a search result's title when no lyrics are available.
+const NO_LYRICS_MARK: char = '\u{f073a}'; // 󰜺
+
+static RE_TITLE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\s*\([^)]*(?:official|lyrics|music|audio|video|hd|visualizer|remastered|4k|edit|version)[^)]*\)\s*$"#)
+        .unwrap()
+});
+
+fn lrclib_blocking_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(LRCLIB_USER_AGENT)
+            .timeout(LRCLIB_TIMEOUT)
+            .build()
+            .expect("failed to build reqwest blocking client")
+    });
+    &CLIENT
+}
+
+fn netease_blocking_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+            ),
+        );
+        headers.insert(
+            reqwest::header::REFERER,
+            reqwest::header::HeaderValue::from_static("https://music.163.com/"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json, text/plain, */*"),
+        );
+        reqwest::blocking::Client::builder()
+            .default_headers(headers)
+            .timeout(LRCLIB_TIMEOUT)
+            .build()
+            .expect("failed to build reqwest blocking client")
+    });
+    &CLIENT
+}
+
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// Returns `true` when the desktop shell (caelestia) will show lyrics for this
+/// search result's download. The shell's Auto backend queries LRCLIB with the
+/// file's exact artist + title tags; when that misses it falls back to a
+/// NetEase search. This replicates that chain, using the artist/title that the
+/// downloader's `--parse-metadata` will write into the file.
+pub fn is_lyrics_viable(item: &YoutubeVideo) -> bool {
+    let (artist, title) = parse_artist_title(&item.title);
+    if artist.is_empty() || title.is_empty() {
+        return false;
+    }
+    lrclib_has_synced(&artist, &title) || netease_has(&artist, &title)
+}
+
+/// Prefix every search result's title with a mark indicating whether caelestia
+/// will show lyrics for it (see [`is_lyrics_viable`]): a check when it will, a
+/// cross when it will not. All items are kept; the marks run concurrently with
+/// a bounded number of threads. Returns the annotated items and how many will
+/// have lyrics.
+pub fn annotate_lyrics_availability(items: Vec<YoutubeVideo>) -> (Vec<YoutubeVideo>, usize) {
+    let counter = Arc::new((
+        std::sync::Mutex::new(0usize),
+        std::sync::Condvar::new(),
+    ));
+    thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|item| {
+                let counter = Arc::clone(&counter);
+                scope.spawn(move || {
+                    let (lock, cvar) = &*counter;
+                    let mut in_flight = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while *in_flight >= MAX_FILTER_CONCURRENCY {
+                        in_flight = cvar
+                            .wait(in_flight)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                    *in_flight += 1;
+                    drop(in_flight);
+
+                    let viable = is_lyrics_viable(&item);
+
+                    let mut in_flight = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    *in_flight -= 1;
+                    cvar.notify_one();
+                    drop(in_flight);
+
+                    let title = if viable {
+                        format!("{HAS_LYRICS_MARK} {}", item.title)
+                    } else {
+                        format!("{NO_LYRICS_MARK} {}", item.title)
+                    };
+                    (
+                        viable,
+                        YoutubeVideo {
+                            title,
+                            ..item
+                        },
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<(bool, YoutubeVideo)> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect();
+        let viable_count = results.iter().filter(|(viable, _)| *viable).count();
+        (
+            results.into_iter().map(|(_, item)| item).collect(),
+            viable_count,
+        )
+    })
+}
+
+/// Mirrors the shell's NetEase fallback: search NetEase for "<title> <artist>",
+/// keep the first song whose first artist's name substring-matches either
+/// direction, then require a non-empty LRC lyric for that song id.
+fn netease_has(artist: &str, title: &str) -> bool {
+    let query = format!("{title} {artist}");
+    let Ok(resp) = netease_blocking_client()
+        .get("https://music.163.com/api/search/get")
+        .query(&[("s", query.as_str()), ("type", "1"), ("limit", "5")])
+        .send()
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(json) = resp.json::<Value>() else {
+        return false;
+    };
+    let Some(songs) = json
+        .get("result")
+        .and_then(|result| result.get("songs"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(id) = songs.iter().find_map(|song| {
+        let Some(song_artist) = song
+            .get("artists")
+            .and_then(Value::as_array)
+            .and_then(|artists| artists.first())
+            .and_then(|artist| artist.get("name"))
+            .and_then(Value::as_str)
+        else {
+            return None;
+        };
+        if contains_ci(artist, song_artist) || contains_ci(song_artist, artist) {
+            song.get("id").and_then(Value::as_u64)
+        } else {
+            None
+        }
+    }) else {
+        return false;
+    };
+
+    let id_str = id.to_string();
+    let Ok(resp) = netease_blocking_client()
+        .get("https://music.163.com/api/song/lyric")
+        .query(&[("id", id_str.as_str()), ("lv", "1"), ("kv", "1"), ("tv", "-1")])
+        .send()
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(json) = resp.json::<Value>() else {
+        return false;
+    };
+    json.get("lrc")
+        .and_then(|lrc| lrc.get("lyric"))
+        .and_then(Value::as_str)
+        .is_some_and(|lrc| !lrc.trim().is_empty())
+}
+
+fn lrclib_has_synced(artist: &str, title: &str) -> bool {
+    let Ok(resp) = lrclib_blocking_client()
+        .get("https://lrclib.net/api/get")
+        .query(&[("artist_name", artist), ("track_name", title)])
+        .send()
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(value) = resp.json::<Value>() else {
+        return false;
+    };
+    value
+        .get("syncedLyrics")
+        .and_then(Value::as_str)
+        .is_some_and(|lyrics| !lyrics.trim().is_empty())
+}
+
+fn parse_artist_title(raw: &str) -> (String, String) {
+    let cleaned = RE_TITLE_SUFFIX.replace(raw, "").trim().to_owned();
+    match cleaned.split_once(" - ") {
+        Some((artist, title)) => (artist.trim().to_owned(), title.trim().to_owned()),
+        None => (String::new(), cleaned),
+    }
+}
