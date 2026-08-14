@@ -273,13 +273,13 @@ const LRCLIB_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FILTER_CONCURRENCY: usize = 6;
 
 /// Prefixed to a search result's title when caelestia will show lyrics for it
-/// (LRCLIB exact match or NetEase, using the tags the downloader will write).
+/// (LRCLIB exact match or `NetEase`, using the tags the downloader will write).
 const HAS_LYRICS_MARK: char = '\u{f00c}'; // 
 /// Prefixed to a search result's title when no lyrics are available.
 const NO_LYRICS_MARK: char = '\u{f073a}'; // 󰜺
 
 static RE_TITLE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\s*\([^)]*(?:official|lyrics|music|audio|video|hd|visualizer|remastered|4k|edit|version)[^)]*\)\s*$"#)
+    Regex::new(r"(?i)\s*\([^)]*(?:official|lyrics|music|audio|video|hd|visualizer|remastered|4k|edit|version)[^)]*\)\s*$")
         .unwrap()
 });
 
@@ -327,8 +327,9 @@ fn contains_ci(haystack: &str, needle: &str) -> bool {
 /// Returns `true` when the desktop shell (caelestia) will show lyrics for this
 /// search result's download. The shell's Auto backend queries LRCLIB with the
 /// file's exact artist + title tags; when that misses it falls back to a
-/// NetEase search. This replicates that chain, using the artist/title that the
+/// `NetEase` search. This replicates that chain, using the artist/title that the
 /// downloader's `--parse-metadata` will write into the file.
+#[must_use]
 pub fn is_lyrics_viable(item: &YoutubeVideo) -> bool {
     let (artist, title) = parse_artist_title(&item.title);
     if artist.is_empty() || title.is_empty() {
@@ -342,11 +343,9 @@ pub fn is_lyrics_viable(item: &YoutubeVideo) -> bool {
 /// cross when it will not. All items are kept; the marks run concurrently with
 /// a bounded number of threads. Returns the annotated items and how many will
 /// have lyrics.
+#[must_use]
 pub fn annotate_lyrics_availability(items: Vec<YoutubeVideo>) -> (Vec<YoutubeVideo>, usize) {
-    let counter = Arc::new((
-        std::sync::Mutex::new(0usize),
-        std::sync::Condvar::new(),
-    ));
+    let counter = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
     thread::scope(|scope| {
         let handles: Vec<_> = items
             .into_iter()
@@ -354,18 +353,22 @@ pub fn annotate_lyrics_availability(items: Vec<YoutubeVideo>) -> (Vec<YoutubeVid
                 let counter = Arc::clone(&counter);
                 scope.spawn(move || {
                     let (lock, cvar) = &*counter;
-                    let mut in_flight = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut in_flight = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     while *in_flight >= MAX_FILTER_CONCURRENCY {
                         in_flight = cvar
                             .wait(in_flight)
-                            .unwrap_or_else(|e| e.into_inner());
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
                     *in_flight += 1;
                     drop(in_flight);
 
                     let viable = is_lyrics_viable(&item);
 
-                    let mut in_flight = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut in_flight = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *in_flight -= 1;
                     cvar.notify_one();
                     drop(in_flight);
@@ -375,13 +378,7 @@ pub fn annotate_lyrics_availability(items: Vec<YoutubeVideo>) -> (Vec<YoutubeVid
                     } else {
                         format!("{NO_LYRICS_MARK} {}", item.title)
                     };
-                    (
-                        viable,
-                        YoutubeVideo {
-                            title,
-                            ..item
-                        },
-                    )
+                    (viable, YoutubeVideo { title, ..item })
                 })
             })
             .collect();
@@ -397,7 +394,7 @@ pub fn annotate_lyrics_availability(items: Vec<YoutubeVideo>) -> (Vec<YoutubeVid
     })
 }
 
-/// Mirrors the shell's NetEase fallback: search NetEase for "<title> <artist>",
+/// Mirrors the shell's `NetEase` fallback: search `NetEase` for "<title> <artist>",
 /// keep the first song whose first artist's name substring-matches either
 /// direction, then require a non-empty LRC lyric for that song id.
 fn netease_has(artist: &str, title: &str) -> bool {
@@ -423,15 +420,12 @@ fn netease_has(artist: &str, title: &str) -> bool {
         return false;
     };
     let Some(id) = songs.iter().find_map(|song| {
-        let Some(song_artist) = song
+        let song_artist = song
             .get("artists")
             .and_then(Value::as_array)
             .and_then(|artists| artists.first())
             .and_then(|artist| artist.get("name"))
-            .and_then(Value::as_str)
-        else {
-            return None;
-        };
+            .and_then(Value::as_str)?;
         if contains_ci(artist, song_artist) || contains_ci(song_artist, artist) {
             song.get("id").and_then(Value::as_u64)
         } else {
@@ -444,7 +438,12 @@ fn netease_has(artist: &str, title: &str) -> bool {
     let id_str = id.to_string();
     let Ok(resp) = netease_blocking_client()
         .get("https://music.163.com/api/song/lyric")
-        .query(&[("id", id_str.as_str()), ("lv", "1"), ("kv", "1"), ("tv", "-1")])
+        .query(&[
+            ("id", id_str.as_str()),
+            ("lv", "1"),
+            ("kv", "1"),
+            ("tv", "-1"),
+        ])
         .send()
     else {
         return false;

@@ -216,7 +216,9 @@ impl Model {
                 },
                 invidious_instance: instance,
             };
-            let _ = tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchSuccess(youtube_options)));
+            let _ = tx.send(Msg::YoutubeSearch(YSMsg::YoutubeSearchSuccess(
+                youtube_options,
+            )));
         });
     }
 
